@@ -4,16 +4,17 @@ PumpTracker Dashboard — FastAPI server
 Run via: uvicorn dashboard:app --host 0.0.0.0 --port $PORT
 """
 
-import json, os, time, sqlite3
+import json, os, time, sqlite3, csv, io
 from collections import defaultdict
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 
 app = FastAPI(title="PumpTracker")
 
 DB_PATH          = os.environ.get("DB_PATH",                  "tracker.db")
 WINNER_THRESHOLD = float(os.environ.get("WINNER_MC_THRESHOLD_SOL", "133"))
 ENTRY_SCORE      = int(os.environ.get("MIN_SCORE_HIGHLIGHT",        "60"))
+BET_SOL          = float(os.environ.get("BET_SIZE_SOL",             "0.1"))
 
 def get_db():
     conn = sqlite3.connect(DB_PATH)
@@ -510,7 +511,249 @@ def get_portfolio():
             "total_deployed":round(len(entries)*bet,4), "strategies":results}
 
 
-BET_SOL = float(os.environ.get("BET_SIZE_SOL", "0.1"))
+@app.get("/api/ai_export")
+def ai_export():
+    """
+    Generates a comprehensive markdown document containing all trade and signal data
+    for AI strategy analysis. Includes every data point that could inform strategy improvement.
+    """
+    conn = get_db()
+    now  = time.time()
+    try:
+        c = conn.cursor()
+
+        # ── Summary stats ─────────────────────────────────
+        c.execute("SELECT COUNT(*) FROM tokens WHERE watch_complete=1"); total_scored = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM entries"); total_entries = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM entries WHERE exit_reason LIKE 'TAKE%'"); total_wins = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM entries WHERE exit_reason='STOP_LOSS'"); total_losses = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM graduations"); total_grads = c.fetchone()[0]
+
+        # ── All entries with full detail ──────────────────
+        c.execute("""
+            SELECT e.mint, e.entry_time, e.entry_mc_sol, e.exit_time, e.exit_mc_sol,
+                   e.exit_reason, e.exit_detail, e.max_mc_sol, e.hold_seconds, e.score,
+                   t.symbol, t.name, t.developer, t.twitter, t.telegram,
+                   t.initial_buy_sol, t.created_at, t.strategies_json, t.stats_json
+            FROM entries e JOIN tokens t ON e.mint=t.mint
+            ORDER BY e.entry_time DESC
+        """)
+        entries = [dict(r) for r in c.fetchall()]
+
+        # ── Missed winners (pumped but not entered) ───────
+        c.execute("""
+            SELECT t.mint, t.symbol, t.name, t.score, t.developer,
+                   t.twitter, t.telegram, t.initial_buy_sol, t.created_at,
+                   t.strategies_json, t.stats_json,
+                   MAX(s.market_cap_sol) as peak_mc
+            FROM tokens t JOIN snapshots s ON t.mint=s.mint
+            WHERE s.market_cap_sol >= ? AND (t.score < ? OR t.score IS NULL)
+            GROUP BY t.mint ORDER BY peak_mc DESC
+        """, (WINNER_THRESHOLD, ENTRY_SCORE))
+        missed = [dict(r) for r in c.fetchall()]
+
+        # ── Score band win rates ───────────────────────────
+        c.execute("""
+            SELECT t.score,
+                   COALESCE((SELECT MAX(tr.market_cap_sol) FROM trades tr WHERE tr.mint=t.mint),0) as peak_mc
+            FROM tokens t WHERE t.watch_complete=1 AND t.score IS NOT NULL
+        """)
+        band_rows = c.fetchall()
+
+        # ── Strategy win rates ────────────────────────────
+        c.execute("""SELECT * FROM strategy_performance
+                     WHERE date=(SELECT MAX(date) FROM strategy_performance)
+                     ORDER BY win_rate DESC""")
+        strat_perf = [dict(r) for r in c.fetchall()]
+
+        # ── Dev wallet hall of fame/shame ─────────────────
+        c.execute("""
+            SELECT wallet, COUNT(*) as launches, SUM(is_winner) as wins,
+                   SUM(is_rug) as rugs, AVG(peak_mc_sol) as avg_peak
+            FROM dev_history
+            GROUP BY wallet HAVING launches >= 2
+            ORDER BY wins DESC LIMIT 20
+        """)
+        dev_stats = [dict(r) for r in c.fetchall()]
+
+    finally:
+        conn.close()
+
+    # ── Build score bands ─────────────────────────────────
+    bands = defaultdict(lambda: {"total": 0, "winners": 0})
+    for row in band_rows:
+        lo = min((row["score"] // 10) * 10, 90)
+        bands[lo]["total"] += 1
+        if row["peak_mc"] >= WINNER_THRESHOLD:
+            bands[lo]["winners"] += 1
+
+    def fmt_strats(strats_json):
+        """Format strategy signals as readable lines."""
+        if not strats_json:
+            return "  No strategy data"
+        try:
+            strats = json.loads(strats_json)
+        except Exception:
+            return "  Parse error"
+        lines = []
+        for k, v in strats.items():
+            status = "✅ FIRED" if v.get("fired") else "❌ miss"
+            kind   = "positive" if v.get("positive") else "NEGATIVE"
+            label  = v.get("label", k)
+            detail = v.get("detail", "")
+            lines.append(f"  [{status}] [{kind:8}] {label}: {detail}")
+        return "\n".join(lines)
+
+    def fmt_stats(stats_json):
+        if not stats_json:
+            return ""
+        try:
+            s = json.loads(stats_json)
+            return (f"  Buys:{s.get('total_buys','?')}  Sells:{s.get('total_sells','?')}  "
+                    f"Unique wallets:{s.get('unique_buyers','?')}  Vol:{s.get('total_vol_sol','?')} SOL")
+        except Exception:
+            return ""
+
+    lines = []
+    ts = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(now))
+
+    # ════════════════════════════════════════════════
+    lines.append(f"# PumpFun Tracker — Full AI Strategy Assessment Export")
+    lines.append(f"Generated: {ts}")
+    lines.append(f"Threshold for 'winner': {WINNER_THRESHOLD} SOL peak MC (~$20k)")
+    lines.append(f"Entry score threshold: {ENTRY_SCORE}/100")
+    lines.append(f"Bet size per trade: {BET_SOL} SOL")
+    lines.append("")
+
+    # ── OVERVIEW ─────────────────────────────────────
+    lines.append("## OVERVIEW")
+    lines.append(f"- Total tokens scored: {total_scored}")
+    lines.append(f"- Total entry signals fired: {total_entries}")
+    win_rate = round(total_wins/max(total_entries,1)*100,1)
+    lines.append(f"- Wins (take profit): {total_wins}  ({win_rate}% of entries)")
+    lines.append(f"- Losses (stop loss): {total_losses}")
+    lines.append(f"- Token graduations to Raydium: {total_grads}")
+    lines.append("")
+
+    # ── SCORE BAND WIN RATES ──────────────────────────
+    lines.append("## SCORE BAND WIN RATES")
+    lines.append("Score range | Tokens | Winners | Win rate | Notes")
+    lines.append("------------|--------|---------|----------|------")
+    for lo in range(0, 100, 10):
+        hi  = lo + 9 if lo < 90 else 100
+        b   = bands[lo]
+        wr  = round(b["winners"]/max(b["total"],1)*100,1)
+        note = " << entry threshold" if lo == 60 else ""
+        note += " (low sample)" if b["total"] < 3 else ""
+        lines.append(f"{lo:2d}–{hi:3d}       | {b['total']:6d} | {b['winners']:7d} | {wr:7.1f}% |{note}")
+    lines.append("")
+
+    # ── STRATEGY PERFORMANCE ──────────────────────────
+    lines.append("## INDIVIDUAL STRATEGY WIN RATES")
+    lines.append("(From nightly optimiser — how often each strategy signal correlates with winners)")
+    lines.append("")
+    if strat_perf:
+        lines.append(f"{'Strategy':<35} {'Type':<9} {'Signals':>7} {'Wins':>5} {'Win%':>6} {'Weight':>7}")
+        lines.append("-" * 70)
+        for sp in strat_perf:
+            kind = "NEGATIVE" if sp["strategy_name"] in (
+                "early_dev_dump","single_wallet_dominance","wash_trading",
+                "no_socials","bundle_detector","early_sell_pressure","known_rugger") else "positive"
+            lines.append(f"{sp['strategy_name']:<35} {kind:<9} {sp['total_signals']:>7} "
+                         f"{sp['wins']:>5} {sp['win_rate']*100:>6.1f}% {sp['weight']:>7.2f}")
+    else:
+        lines.append("No strategy performance data yet — needs nightly optimiser to run (requires 10+ tokens with snapshot data).")
+    lines.append("")
+
+    # ── DEV WALLET HISTORY ────────────────────────────
+    if dev_stats:
+        lines.append("## DEV WALLET HISTORY (repeat launchers, ≥2 launches)")
+        lines.append(f"{'Wallet':<46} {'Launches':>8} {'Wins':>5} {'Rugs':>5} {'Avg Peak MC':>12}")
+        lines.append("-" * 80)
+        for d in dev_stats:
+            lines.append(f"{d['wallet']:<46} {d['launches']:>8} {d['wins'] or 0:>5} "
+                         f"{d['rugs'] or 0:>5} {d['avg_peak'] or 0:>11.1f} SOL")
+        lines.append("")
+
+    # ── ENTERED TRADES ────────────────────────────────
+    lines.append("## ENTERED TRADES — FULL DETAIL")
+    lines.append(f"Total: {len(entries)}")
+    lines.append("")
+    for e in entries:
+        roi     = round(e["exit_mc_sol"]/e["entry_mc_sol"],2) if e.get("exit_mc_sol") and e.get("entry_mc_sol") else None
+        max_roi = round(e["max_mc_sol"]/e["entry_mc_sol"],2)  if e.get("max_mc_sol")  and e.get("entry_mc_sol") else None
+        outcome = e.get("exit_reason") or "OPEN"
+        entry_t = time.strftime("%Y-%m-%d %H:%M", time.gmtime(e["entry_time"])) if e.get("entry_time") else "?"
+        exit_t  = time.strftime("%Y-%m-%d %H:%M", time.gmtime(e["exit_time"]))  if e.get("exit_time")  else "still open"
+        hold    = f"{e['hold_seconds']//60}m" if e.get("hold_seconds") else "open"
+
+        lines.append(f"### ${e.get('symbol','?')} — {e.get('name','?')}")
+        lines.append(f"Mint:         {e['mint']}")
+        lines.append(f"Score:        {e.get('score','?')}/100")
+        lines.append(f"Has Twitter:  {'Yes' if e.get('twitter') else 'No'}  |  Has Telegram: {'Yes' if e.get('telegram') else 'No'}")
+        lines.append(f"Dev init buy: {e.get('initial_buy_sol', 0):.3f} SOL")
+        lines.append(f"Entry time:   {entry_t}")
+        lines.append(f"Entry MC:     {e.get('entry_mc_sol', 0):.2f} SOL")
+        lines.append(f"Exit time:    {exit_t}")
+        lines.append(f"Exit MC:      {e.get('exit_mc_sol', 0) or '—'}{' SOL' if e.get('exit_mc_sol') else ''}")
+        lines.append(f"Exit reason:  {outcome}")
+        if e.get("exit_detail"):
+            lines.append(f"Exit detail:  {e['exit_detail']}")
+        lines.append(f"Max MC seen:  {e.get('max_mc_sol', 0):.2f} SOL  (best possible: {max_roi}x)")
+        lines.append(f"Actual ROI:   {roi}x" if roi else "Actual ROI:  open")
+        lines.append(f"Hold time:    {hold}")
+        lines.append(f"Trade stats:  {fmt_stats(e.get('stats_json',''))}")
+        lines.append("Strategy signals:")
+        lines.append(fmt_strats(e.get("strategies_json", "")))
+        lines.append("")
+
+    # ── MISSED WINNERS ────────────────────────────────
+    lines.append("## MISSED WINNERS — FULL DETAIL")
+    lines.append(f"Tokens that pumped above {WINNER_THRESHOLD} SOL but scored below {ENTRY_SCORE}: {len(missed)}")
+    lines.append("These are the most valuable for improving entry strategy.")
+    lines.append("")
+    for m in missed:
+        peak   = m.get("peak_mc", 0)
+        score  = m.get("score") or 0
+        gap    = ENTRY_SCORE - score
+        launch = time.strftime("%Y-%m-%d %H:%M", time.gmtime(m["created_at"])) if m.get("created_at") else "?"
+
+        lines.append(f"### ${m.get('symbol','?')} — {m.get('name','?')}")
+        lines.append(f"Mint:         {m['mint']}")
+        lines.append(f"Score:        {score}/100  (missed entry by {gap} points)")
+        lines.append(f"Peak MC:      {peak:.1f} SOL  ({peak/WINNER_THRESHOLD:.1f}x above threshold)")
+        lines.append(f"Launched:     {launch}")
+        lines.append(f"Has Twitter:  {'Yes' if m.get('twitter') else 'No'}  |  Has Telegram: {'Yes' if m.get('telegram') else 'No'}")
+        lines.append(f"Dev init buy: {m.get('initial_buy_sol', 0):.3f} SOL")
+        lines.append(f"Trade stats:  {fmt_stats(m.get('stats_json',''))}")
+        lines.append("Strategy signals (what fired, what didn't — why we missed it):")
+        lines.append(fmt_strats(m.get("strategies_json", "")))
+        lines.append("")
+
+    # ── AI PROMPTING GUIDE ────────────────────────────
+    lines.append("## HOW TO USE THIS DOCUMENT WITH AI")
+    lines.append("""
+Paste this document into an AI model (Claude, GPT-4, etc.) with a prompt like:
+
+> "You are a quantitative analyst reviewing a pump.fun memecoin signal system.
+> The data above shows all trades entered, all missed winners, strategy signal win rates,
+> and score band performance. Please:
+> 1. Identify which strategies have the highest win rate and should be weighted more heavily
+> 2. Identify strategies that appear to be hurting performance (high fire rate, low win rate)
+> 3. Look at the missed winners — what signals DID fire vs what didn't — 
+>    what threshold adjustments would have caught more of them?
+> 4. Look at losing trades — what signals should have flagged them as risky?
+> 5. Suggest an optimal entry score threshold based on the score band data
+> 6. Suggest any new signal ideas based on patterns you notice in the data"
+
+The more data you accumulate (days/weeks of running), the more useful this export becomes.
+""")
+
+    content = "\n".join(lines)
+    buf = io.BytesIO(content.encode("utf-8"))
+    fname = f"pump_strategy_export_{time.strftime('%Y%m%d_%H%M')}.md"
+    return StreamingResponse(buf, media_type="text/markdown",
+                             headers={"Content-Disposition": f"attachment; filename={fname}"})
 
 
 # ════════════════════════════════════════════════════════
@@ -787,6 +1030,7 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'Fira C
     <div class="hstat"><div class="hstat-v" id="h-total">—</div><div class="hstat-l">Total</div></div>
   </div>
   <button class="refresh-btn" onclick="refreshAll()">↻</button>
+  <a href="/api/ai_export" class="refresh-btn" style="text-decoration:none;display:flex;align-items:center">🤖 Export</a>
 </div>
 
 <div class="tabs">
@@ -1250,6 +1494,114 @@ function renderScoreBands(bands) {
 
 const WINNER_THRESHOLD = 133;
 
+// ── PORTFOLIO RENDERER ──────────────────────────────────
+function renderPortfolio(data) {
+  document.getElementById('tb-port').textContent = data.strategies?.length ?? 0;
+  if (!data.total_trades) return `<div class="empty"><div class="icon">💼</div>
+    <div class="title">NO TRADES YET</div>
+    <div class="sub">Portfolio simulation populates once entry signals have been logged</div></div>`;
+
+  const best  = data.strategies[0];
+  const worst = data.strategies[data.strategies.length - 1];
+  const maxPnl = Math.abs(best.total_pnl || 0.001);
+
+  const summary = `
+  <div class="summary-bar" style="margin-bottom:14px">
+    <div class="sbar-item"><div class="sbar-v">${data.total_trades}</div><div class="sbar-l">Trades</div></div>
+    <div class="sbar-item"><div class="sbar-v">${data.bet_sol} SOL</div><div class="sbar-l">Bet Size</div></div>
+    <div class="sbar-item"><div class="sbar-v">${data.total_deployed} SOL</div><div class="sbar-l">Deployed</div></div>
+    <div class="sbar-item"><div class="sbar-v" style="color:var(--green)">${best.name.split(' ')[0]}…</div><div class="sbar-l">Best Strategy</div></div>
+    <div class="sbar-item"><div class="sbar-v" style="color:${best.total_pnl>=0?'var(--green)':'var(--red)'}">
+      ${best.total_pnl>=0?'+':''}${best.total_pnl.toFixed(3)} SOL</div><div class="sbar-l">Best P&L</div></div>
+  </div>
+  <div class="section-title"><span>9 Exit Strategies Compared</span>
+    <span style="color:var(--dim)">Simulated across all ${data.total_trades} real entries · ${data.bet_sol} SOL per trade</span></div>`;
+
+  const rows = data.strategies.map((s, i) => {
+    const isB  = i === 0;
+    const isW  = i === data.strategies.length - 1;
+    const pos  = s.total_pnl >= 0;
+    const pct  = Math.abs(s.total_pnl) / maxPnl * 100;
+    const col  = pos ? 'var(--green)' : 'var(--red)';
+    return `
+    <div class="port-strat${isB?' best':isW?' worst':''}">
+      <div class="port-top">
+        <div class="port-name">${isB?'🏆 ':''}${isW?'📉 ':''}${s.name}</div>
+        <div class="port-pnl ${pos?'pos':'neg'}">${pos?'+':''}${s.total_pnl.toFixed(3)} SOL</div>
+      </div>
+      <div class="port-bar-wrap">
+        <div class="port-bar-fill" style="width:${pct}%;background:${col}"></div>
+      </div>
+      <div class="port-meta">
+        <span>Wins: <span class="hl">${s.win_count}</span></span>
+        <span>Losses: <span class="hl">${s.loss_count}</span></span>
+        <span>Win rate: <span class="hl">${s.win_rate}%</span></span>
+        <span>Avg/trade: <span class="hl">${s.avg_pnl>=0?'+':''}${s.avg_pnl.toFixed(4)} SOL</span></span>
+        <span>Best: <span class="hl">+${s.best_trade.toFixed(3)}</span></span>
+        <span>Worst: <span class="hl">${s.worst_trade.toFixed(3)}</span></span>
+      </div>
+      <div class="port-desc">${s.desc}</div>
+    </div>`;
+  }).join('');
+
+  return summary + rows + `
+  <div style="margin-top:12px;font-size:10px;color:var(--dim);padding:0 4px;line-height:1.7">
+    ▸ All figures are simulated from real entry/exit MC data — not actual on-chain trades.<br>
+    ▸ "Peak Ideal" shows theoretical max if you always sold at highest MC seen — useful as an upside benchmark.<br>
+    ▸ Strategies using the bot's actual exit logic inherit TP/SL/time exits from tracker.py CONFIG.
+  </div>`;
+}
+
+// ── MARKET CONDITIONS RENDERER ──────────────────────────
+function renderMarket(d) {
+  document.getElementById('tb-mkt').textContent = d.score ?? '—';
+  const col     = d.rec_color==='green'?'var(--green)':d.rec_color==='amber'?'var(--amber)':'var(--red)';
+  const barCol  = d.score>=65?'var(--green)':d.score>=40?'var(--amber)':'var(--red)';
+  const updated = d.timestamp ? new Date(d.timestamp*1000).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}) : '—';
+
+  const scoreBlock = `
+  <div style="text-align:center;padding:20px 0 8px">
+    <div style="font-family:'Space Mono',monospace;font-size:56px;font-weight:700;color:${col};line-height:1">${d.score}</div>
+    <div style="font-size:11px;color:var(--dim);margin:2px 0 6px">/ 100</div>
+    <div style="font-family:'Space Mono',monospace;font-size:15px;font-weight:700;letter-spacing:4px;color:${col}">${d.recommendation}</div>
+    <div style="font-size:10px;color:var(--dim);margin-top:4px">Updated ${updated}</div>
+  </div>
+  <div class="market-bar-wrap">
+    <div class="market-bar-fill" style="width:${d.score}%;background:${barCol}"></div>
+  </div>`;
+
+  const sigCards = (d.signals||[]).map(sig => {
+    const c = sig.status==='good'?'var(--green)':sig.status==='warn'?'var(--amber)':'var(--red)';
+    return `<div class="signal-card ${sig.status}">
+      <div class="sig-name">${sig.name} <span class="sig-pts" style="color:${c}">${sig.pts}/${sig.max}</span></div>
+      <div class="sig-value">${sig.value}</div>
+      <div class="sig-detail">${sig.detail}</div>
+    </div>`;
+  }).join('');
+
+  const guidance = d.score>=65
+    ? `<div class="band-insight" style="border-left-color:var(--green)">
+        ✅ <b>Conditions look good for trading.</b> Multiple positive signals active.
+        Watch for any rapid score drops which could indicate conditions turning.</div>`
+    : d.score>=40
+    ? `<div class="band-insight" style="border-left-color:var(--amber)">
+        ⚠️ <b>Mixed conditions — trade with reduced size or be more selective.</b>
+        Only enter the highest-scoring tokens (70+) until conditions improve.</div>`
+    : `<div class="band-insight" style="border-left-color:var(--red)">
+        🔴 <b>Poor conditions — consider pausing entries.</b>
+        Most tokens launched in bearish/low-activity markets underperform significantly.</div>`;
+
+  return `<div class="section-title"><span>Market Conditions Score</span>
+    <span style="color:var(--dim)">Refreshes every 5s · external APIs polled on each load</span></div>
+  ${guidance}${scoreBlock}
+  <div class="market-grid" style="margin-top:14px">${sigCards}</div>
+  <div style="margin-top:8px;font-size:10px;color:var(--dim);line-height:1.7">
+    ▸ Internal signals (launch rate, quality, win rate, buy pressure, graduations) use live DB data.<br>
+    ▸ SOL price from CoinGecko free tier · Fear & Greed from alternative.me — both may occasionally be unavailable.<br>
+    ▸ This score is advisory only — use it alongside your own judgement.
+  </div>`;
+}
+
 // ── STATS ───────────────────────────────────────────────
 async function loadStats() {
   try {
@@ -1275,6 +1627,8 @@ const tabLoaders = {
   winners:    ()=>fetchAndRender('/api/winners',    'page-winners',    renderWinners),
   strategies: ()=>fetchAndRender('/api/strategies', 'page-strategies', renderStrategies),
   scorebands: ()=>fetchAndRender('/api/score_bands','page-scorebands', renderScoreBands),
+  portfolio:  ()=>fetchAndRender('/api/portfolio',  'page-portfolio',  renderPortfolio),
+  market:     ()=>fetchAndRender('/api/market',     'page-market',     renderMarket),
 };
 
 function switchTab(name, el) {

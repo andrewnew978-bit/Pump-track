@@ -649,6 +649,21 @@ def save_token_result(token: dict, trades: list, strategies: dict, score: int):
             "total_trades":  len(trades),
             "total_vol_sol": round(sum(t["sol_amount"] for t in buys), 4),
         }
+
+        # Volume profile across 4 time buckets (0-30s, 30-60s, 60-90s, 90-120s)
+        created_at = token.get("created_at", time.time())
+        def vol_in(t_start, t_end):
+            return round(sum(t["sol_amount"] for t in buys
+                             if t_start <= t["timestamp"] - created_at < t_end), 3)
+        stats["vol_0_30"]  = vol_in(0,  30)
+        stats["vol_30_60"] = vol_in(30, 60)
+        stats["vol_60_90"] = vol_in(60, 90)
+        stats["vol_90_120"]= vol_in(90, 120)
+
+        # Peak MC and bonding curve % (graduation at ~580 SOL total market cap)
+        peak_mc = max((t.get("market_cap_sol", 0) for t in trades), default=0)
+        stats["peak_mc_sol"] = round(peak_mc, 2)
+        stats["bc_pct"]      = round(min(peak_mc / 580 * 100, 100), 1)
         # Save full strategy data including label, detail, threshold for UI
         strat_save = {
             k: {
